@@ -14,7 +14,6 @@ import os
 from decimal import Decimal, InvalidOperation
 from html import escape
 
-import asyncpg
 from aiogram import Bot, Dispatcher, F
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
