@@ -414,12 +414,4 @@ async def write_audit_log(
         entity_id,
         payload,
     )
-```
-
-### Important before restarting BotKeep
-
-This version removes the ZIP-validation requirement, but **the existing `main.py` must also be updated** so it no longer imports `zip_security` or expects validation columns. We'll do that next.
-
-Also, if you've already run the earlier migration that added ZIP-validation columns, PostgreSQL will keep those columns; this replacement doesn't delete them or erase course records.
-
-Once you've committed this file, tell me **“Done”** and we'll update `main.py` to match it.
+``
