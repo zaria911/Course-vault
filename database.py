@@ -1,453 +1,848 @@
 
-"""CourseVault SQLite database layer.
-
-Uses a local SQLite file instead of PostgreSQL.
-No external database server or database credentials required.
+"""CourseVault — Telegram course marketplace.
+SQLite edition for BotKeep.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import os
-import sqlite3
-from pathlib import Path
-from typing import Any
+from decimal import Decimal, InvalidOperation
+from html import escape
+
+import asyncpg  # REMOVE THIS LINE IF PRESENT IN YOUR OLD FILE
+
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+)
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+import database
 
 
-DEFAULT_DB_PATH = "coursevault.db"
+# --------------------------------------------------
+# Configuration
+# --------------------------------------------------
+
+class Settings(BaseSettings):
+    bot_token: str = Field(min_length=20)
+    owner_telegram_id: int = Field(gt=0)
+    log_level: str = "INFO"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+        case_sensitive=False,
+    )
 
 
-def _database_path() -> str:
-    """Resolve the local database path."""
-    path = os.getenv("SQLITE_DB_PATH", DEFAULT_DB_PATH).strip()
-    if not path:
-        raise ValueError("SQLITE_DB_PATH cannot be empty.")
+settings = Settings()
 
-    if path != ":memory:":
-        Path(path).expanduser().resolve().parent.mkdir(
-            parents=True, exist_ok=True
-        )
-        return str(Path(path).expanduser())
+logging.basicConfig(
+    level=getattr(logging, settings.log_level.upper(), logging.INFO),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("coursevault")
 
-    return path
+bot = Bot(
+    token=settings.bot_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+dp = Dispatcher()
 
+db: database.SQLiteDatabase | None = None
 
-class SQLiteDatabase:
-    """Small async-compatible SQLite database wrapper."""
-
-    def __init__(self, path: str) -> None:
-        self.path = path
-
-    def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path,
-            timeout=15,
-            isolation_level="DEFERRED",
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 15000")
-
-        if self.path != ":memory:":
-            connection.execute("PRAGMA journal_mode = WAL")
-
-        return connection
-
-    async def run(self, function, *args):
-        """Run SQLite work off the event loop."""
-        return await asyncio.to_thread(function, *args)
-
-    async def close(self) -> None:
-        """No persistent connection is held open."""
-        return None
+MAX_ZIP_BYTES = 19 * 1024 * 1024
+MAX_TITLE_LENGTH = 100
+MAX_CATEGORY_LENGTH = 60
+MAX_DESCRIPTION_LENGTH = 2000
+MAX_EXTRA_LENGTH = 1000
 
 
-async def create_pool(database_url: str | None = None) -> SQLiteDatabase:
-    """Initialize SQLite and create/update the schema.
+# --------------------------------------------------
+# Course creation states
+# --------------------------------------------------
 
-    The optional argument exists for compatibility with the previous
-    PostgreSQL startup call. SQLite does not use a database URL.
-    """
-    del database_url
-
-    path = _database_path()
-    database = SQLiteDatabase(path)
-    await database.run(_initialize, path)
-    return database
-
-
-def _initialize(path: str) -> None:
-    database = SQLiteDatabase(path)
-    connection = database._connect()
-
-    try:
-        connection.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS schema_migrations (
-                version INTEGER PRIMARY KEY,
-                applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS users (
-                telegram_id INTEGER PRIMARY KEY,
-                username TEXT,
-                first_name TEXT NOT NULL DEFAULT '',
-                recommendations_enabled INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS courses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                title TEXT NOT NULL,
-                category TEXT NOT NULL,
-                price_paise INTEGER NOT NULL DEFAULT 0,
-                description TEXT NOT NULL DEFAULT '',
-                impact TEXT NOT NULL DEFAULT '',
-                prerequisites TEXT NOT NULL DEFAULT '',
-                telegram_file_id TEXT,
-                status TEXT NOT NULL DEFAULT 'draft'
-                    CHECK (status IN ('draft', 'published', 'archived')),
-                created_by INTEGER,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE TABLE IF NOT EXISTS wishlists (
-                telegram_id INTEGER NOT NULL,
-                course_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (telegram_id, course_id),
-                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id)
-                    ON DELETE CASCADE,
-                FOREIGN KEY (course_id) REFERENCES courses(id)
-                    ON DELETE CASCADE
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                telegram_id INTEGER NOT NULL,
-                course_id INTEGER NOT NULL,
-                amount_paise INTEGER NOT NULL,
-                status TEXT NOT NULL DEFAULT 'pending',
-                provider TEXT,
-                provider_payment_id TEXT,
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
-                FOREIGN KEY (course_id) REFERENCES courses(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS entitlements (
-                telegram_id INTEGER NOT NULL,
-                course_id INTEGER NOT NULL,
-                order_id INTEGER,
-                granted_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                PRIMARY KEY (telegram_id, course_id),
-                FOREIGN KEY (telegram_id) REFERENCES users(telegram_id),
-                FOREIGN KEY (course_id) REFERENCES courses(id),
-                FOREIGN KEY (order_id) REFERENCES orders(id)
-            );
-
-            CREATE TABLE IF NOT EXISTS audit_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                actor_telegram_id INTEGER,
-                action TEXT NOT NULL,
-                target_type TEXT,
-                target_id TEXT,
-                details TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_courses_status_category
-                ON courses(status, category);
-
-            CREATE INDEX IF NOT EXISTS idx_orders_user
-                ON orders(telegram_id, created_at);
-
-            CREATE INDEX IF NOT EXISTS idx_audit_logs_created
-                ON audit_logs(created_at);
-            """
-        )
-
-        connection.execute(
-            """
-            INSERT OR IGNORE INTO schema_migrations (version)
-            VALUES (1)
-            """
-        )
-        connection.commit()
-    finally:
-        connection.close()
+class CourseDraft(StatesGroup):
+    title = State()
+    category = State()
+    price = State()
+    description = State()
+    impact = State()
+    prerequisites = State()
+    zip_file = State()
 
 
-def _fetchall(path: str, query: str, parameters: tuple = ()) -> list[dict]:
-    connection = SQLiteDatabase(path)._connect()
-    try:
-        rows = connection.execute(query, parameters).fetchall()
-        return [dict(row) for row in rows]
-    finally:
-        connection.close()
+# --------------------------------------------------
+# Helpers
+# --------------------------------------------------
+
+def get_db() -> database.SQLiteDatabase:
+    if db is None:
+        raise RuntimeError("Database has not been initialized.")
+    return db
 
 
-def _fetchone(path: str, query: str, parameters: tuple = ()) -> dict | None:
-    connection = SQLiteDatabase(path)._connect()
-    try:
-        row = connection.execute(query, parameters).fetchone()
-        return dict(row) if row else None
-    finally:
-        connection.close()
+def is_owner(user_id: int | None) -> bool:
+    return user_id == settings.owner_telegram_id
 
 
-async def upsert_user(
-    database: SQLiteDatabase,
-    telegram_id: int,
-    username: str | None,
-    first_name: str,
-) -> None:
-    def operation() -> None:
-        connection = database._connect()
-        try:
-            connection.execute(
-                """
-                INSERT INTO users (telegram_id, username, first_name)
-                VALUES (?, ?, ?)
-                ON CONFLICT(telegram_id) DO UPDATE SET
-                    username = excluded.username,
-                    first_name = excluded.first_name,
-                    updated_at = CURRENT_TIMESTAMP
-                """,
-                (telegram_id, username, first_name or ""),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
-    await database.run(operation)
+def money(price_paise: int) -> str:
+    return f"₹{price_paise / 100:,.2f}"
 
 
-async def list_categories(database: SQLiteDatabase) -> list[str]:
-    return await database.run(
-        lambda: [
-            row["category"]
-            for row in _fetchall(
-                database.path,
-                """
-                SELECT DISTINCT category FROM courses
-                WHERE status = 'published'
-                ORDER BY category COLLATE NOCASE
-                """,
-            )
+def main_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="📚 Browse courses",
+                    callback_data="browse",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🗂 Categories",
+                    callback_data="categories",
+                ),
+                InlineKeyboardButton(
+                    text="❤️ Wishlist",
+                    callback_data="wishlist",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🤖 AI features",
+                    callback_data="ai_info",
+                )
+            ],
         ]
     )
 
 
-async def list_courses(
-    database: SQLiteDatabase,
+def back_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="🏠 Main menu",
+                    callback_data="home",
+                )
+            ]
+        ]
+    )
+
+
+def course_keyboard(course_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="❤️ Save to wishlist",
+                    callback_data=f"save:{course_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🛒 Buy course (coming soon)",
+                    callback_data="buy_disabled",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="↩️ Browse courses",
+                    callback_data="browse",
+                )
+            ],
+        ]
+    )
+
+
+async def show_courses(
+    message: Message,
     category: str | None = None,
-) -> list[dict]:
-    if category:
-        return await database.run(
-            _fetchall,
-            database.path,
-            """
-            SELECT * FROM courses
-            WHERE status = 'published' AND category = ?
-            ORDER BY created_at DESC, id DESC
-            """,
-            (category,),
+) -> None:
+    courses = await database.list_courses(get_db(), category)
+
+    if not courses:
+        await message.answer(
+            "No published courses are available yet.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    for course in courses[:30]:
+        title = escape(course["title"])
+        category_name = escape(course["category"])
+        price = money(course["price_paise"])
+
+        await message.answer(
+            f"<b>{title}</b>\n"
+            f"📂 {category_name}\n"
+            f"💰 {price}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="View course",
+                            callback_data=f"course:{course['id']}",
+                        )
+                    ]
+                ]
+            ),
         )
 
-    return await database.run(
-        _fetchall,
-        database.path,
-        """
-        SELECT * FROM courses
-        WHERE status = 'published'
-        ORDER BY created_at DESC, id DESC
-        """,
-    )
 
+async def show_categories(message: Message) -> None:
+    categories = await database.list_categories(get_db())
 
-async def get_course(
-    database: SQLiteDatabase,
-    course_id: int,
-) -> dict | None:
-    return await database.run(
-        _fetchone,
-        database.path,
-        """
-        SELECT * FROM courses
-        WHERE id = ? AND status = 'published'
-        """,
-        (course_id,),
-    )
+    if not categories:
+        await message.answer(
+            "No course categories are available yet.",
+            reply_markup=back_menu(),
+        )
+        return
 
-
-async def add_to_wishlist(
-    database: SQLiteDatabase,
-    telegram_id: int,
-    course_id: int,
-) -> bool:
-    def operation() -> bool:
-        connection = database._connect()
-        try:
-            course = connection.execute(
-                "SELECT id FROM courses WHERE id = ? AND status = 'published'",
-                (course_id,),
-            ).fetchone()
-            user = connection.execute(
-                "SELECT telegram_id FROM users WHERE telegram_id = ?",
-                (telegram_id,),
-            ).fetchone()
-
-            if not course or not user:
-                return False
-
-            connection.execute(
-                """
-                INSERT OR IGNORE INTO wishlists (telegram_id, course_id)
-                VALUES (?, ?)
-                """,
-                (telegram_id, course_id),
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=category[:60],
+                callback_data=f"category:{index}",
             )
-            connection.commit()
-            return True
-        finally:
-            connection.close()
+        ]
+        for index, category in enumerate(categories[:50])
+    ]
+    rows.append(
+        [InlineKeyboardButton(text="🏠 Home", callback_data="home")]
+    )
 
-    return await database.run(operation)
-
-
-async def list_wishlist(
-    database: SQLiteDatabase,
-    telegram_id: int,
-) -> list[dict]:
-    return await database.run(
-        _fetchall,
-        database.path,
-        """
-        SELECT c.* FROM courses c
-        INNER JOIN wishlists w ON w.course_id = c.id
-        WHERE w.telegram_id = ? AND c.status = 'published'
-        ORDER BY w.created_at DESC
-        """,
-        (telegram_id,),
+    await message.answer(
+        "<b>📂 Course categories</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
 
 
-async def list_course_drafts(database: SQLiteDatabase) -> list[dict]:
-    return await database.run(
-        _fetchall,
-        database.path,
-        """
-        SELECT * FROM courses
-        WHERE status = 'draft'
-        ORDER BY created_at DESC, id DESC
-        """,
+# --------------------------------------------------
+# Basic commands
+# --------------------------------------------------
+
+@dp.message(CommandStart())
+async def start(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    await database.upsert_user(
+        get_db(),
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.first_name or "",
+    )
+
+    await message.answer(
+        "👋 Welcome to <b>CourseVault</b>!\n\n"
+        "Explore courses, save your favourites, and discover "
+        "learning opportunities.\n\n"
+        "Course purchases are not available yet.",
+        reply_markup=main_menu(),
     )
 
 
-async def write_audit_log(
-    database: SQLiteDatabase,
-    actor_id: int | None,
-    action: str,
-    target_type: str | None = None,
-    target_id: str | int | None = None,
-    details: dict[str, Any] | None = None,
+@dp.message(Command("help"))
+async def help_command(message: Message) -> None:
+    text = (
+        "<b>CourseVault commands</b>\n\n"
+        "/start — Open the main menu\n"
+        "/courses — Browse published courses\n"
+        "/categories — Browse categories\n"
+        "/wishlist — View saved courses\n"
+    )
+
+    if message.from_user and is_owner(message.from_user.id):
+        text += (
+            "\n<b>Owner commands</b>\n"
+            "/addcourse — Create a course draft\n"
+            "/drafts — List course drafts\n"
+            "/publish ID — Request publication confirmation\n"
+        )
+
+    await message.answer(text)
+
+
+@dp.message(Command("courses"))
+async def courses_command(message: Message) -> None:
+    await show_courses(message)
+
+
+@dp.message(Command("categories"))
+async def categories_command(message: Message) -> None:
+    await show_categories(message)
+
+
+@dp.message(Command("wishlist"))
+async def wishlist_command(message: Message) -> None:
+    if not message.from_user:
+        return
+
+    courses = await database.list_wishlist(
+        get_db(),
+        message.from_user.id,
+    )
+
+    if not courses:
+        await message.answer(
+            "Your wishlist is empty.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    for course in courses[:30]:
+        await message.answer(
+            f"❤️ <b>{escape(course['title'])}</b>\n"
+            f"💰 {money(course['price_paise'])}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="View course",
+                            callback_data=f"course:{course['id']}",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+
+# --------------------------------------------------
+# Main menu callbacks
+# --------------------------------------------------
+
+@dp.callback_query(F.data == "home")
+async def home_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await callback.message.answer(
+            "<b>CourseVault</b>\nChoose an option:",
+            reply_markup=main_menu(),
+        )
+
+
+@dp.callback_query(F.data == "browse")
+async def browse_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await show_courses(callback.message)
+
+
+@dp.callback_query(F.data == "categories")
+async def categories_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+    if callback.message:
+        await show_categories(callback.message)
+
+
+@dp.callback_query(F.data.startswith("category:"))
+async def category_callback(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+
+    try:
+        index = int(callback.data.split(":", 1)[1])
+        categories = await database.list_categories(get_db())
+
+        if index < 0 or index >= len(categories):
+            await callback.answer("Category not found.", show_alert=True)
+            return
+
+        await callback.answer()
+        await show_courses(callback.message, categories[index])
+
+    except (ValueError, IndexError):
+        await callback.answer("Invalid category.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("course:"))
+async def course_callback(callback: CallbackQuery) -> None:
+    if not callback.data or not callback.message:
+        await callback.answer()
+        return
+
+    try:
+        course_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Invalid course.", show_alert=True)
+        return
+
+    course = await database.get_course(get_db(), course_id)
+
+    if not course:
+        await callback.answer("Course not found.", show_alert=True)
+        return
+
+    await callback.answer()
+
+    description = escape(course["description"] or "No description provided.")
+    impact = escape(course["impact"] or "Not specified")
+    prerequisites = escape(course["prerequisites"] or "Not specified")
+
+    await callback.message.answer(
+        f"<b>{escape(course['title'])}</b>\n\n"
+        f"📂 {escape(course['category'])}\n"
+        f"💰 {money(course['price_paise'])}\n\n"
+        f"<b>Description</b>\n{description}\n\n"
+        f"<b>What you'll learn</b>\n{impact}\n\n"
+        f"<b>Prerequisites</b>\n{prerequisites}",
+        reply_markup=course_keyboard(course_id),
+    )
+
+
+@dp.callback_query(F.data == "wishlist")
+async def wishlist_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+    if not callback.from_user or not callback.message:
+        return
+
+    courses = await database.list_wishlist(
+        get_db(),
+        callback.from_user.id,
+    )
+
+    if not courses:
+        await callback.message.answer(
+            "Your wishlist is empty.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    for course in courses[:30]:
+        await callback.message.answer(
+            f"❤️ <b>{escape(course['title'])}</b>\n"
+            f"💰 {money(course['price_paise'])}",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="View course",
+                            callback_data=f"course:{course['id']}",
+                        )
+                    ]
+                ]
+            ),
+        )
+
+
+@dp.callback_query(F.data.startswith("save:"))
+async def save_callback(callback: CallbackQuery) -> None:
+    if not callback.data:
+        await callback.answer()
+        return
+
+    try:
+        course_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Invalid course.", show_alert=True)
+        return
+
+    if not callback.from_user:
+        await callback.answer("Unable to identify your account.")
+        return
+
+    saved = await database.add_to_wishlist(
+        get_db(),
+        callback.from_user.id,
+        course_id,
+    )
+
+    if saved:
+        await callback.answer("Saved to your wishlist ❤️")
+    else:
+        await callback.answer(
+            "Course unavailable. Try /start first.",
+            show_alert=True,
+        )
+
+
+@dp.callback_query(F.data == "buy_disabled")
+async def buy_disabled_callback(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "Purchases are not enabled yet.",
+        show_alert=True,
+    )
+
+
+@dp.callback_query(F.data == "ai_info")
+async def ai_info_callback(callback: CallbackQuery) -> None:
+    await callback.answer()
+
+    if callback.message:
+        await callback.message.answer(
+            "🤖 <b>AI features are planned</b>\n\n"
+            "AI tutoring and AI Course Studio are not enabled yet.",
+            reply_markup=back_menu(),
+        )
+
+
+# --------------------------------------------------
+# Owner-only course draft workflow
+# --------------------------------------------------
+
+@dp.message(Command("addcourse"))
+async def add_course_command(
+    message: Message,
+    state: FSMContext,
 ) -> None:
-    if not action or len(action) > 100:
-        raise ValueError("Audit action must be 1–100 characters.")
+    if not message.from_user or not is_owner(message.from_user.id):
+        await message.answer("⛔ This command is owner-only.")
+        return
 
-    serialized_details = json.dumps(
-        details or {},
-        ensure_ascii=False,
-        separators=(",", ":"),
+    await state.clear()
+    await state.set_state(CourseDraft.title)
+    await message.answer("Enter the course title (maximum 100 characters).")
+
+
+@dp.message(CourseDraft.title)
+async def draft_title(message: Message, state: FSMContext) -> None:
+    title = (message.text or "").strip()
+
+    if not title or len(title) > MAX_TITLE_LENGTH:
+        await message.answer("Enter a title between 1 and 100 characters.")
+        return
+
+    await state.update_data(title=title)
+    await state.set_state(CourseDraft.category)
+    await message.answer("Enter the course category.")
+
+
+@dp.message(CourseDraft.category)
+async def draft_category(message: Message, state: FSMContext) -> None:
+    category = (message.text or "").strip()
+
+    if not category or len(category) > MAX_CATEGORY_LENGTH:
+        await message.answer("Enter a category between 1 and 60 characters.")
+        return
+
+    await state.update_data(category=category)
+    await state.set_state(CourseDraft.price)
+    await message.answer("Enter the course price in INR, for example: 249.00")
+
+
+@dp.message(CourseDraft.price)
+async def draft_price(message: Message, state: FSMContext) -> None:
+    raw = (message.text or "").strip()
+
+    try:
+        price = Decimal(raw)
+        if not price.is_finite() or price < 0 or price > Decimal("1000000"):
+            raise InvalidOperation
+        price_paise = int(price * 100)
+        if price * 100 != price_paise:
+            raise InvalidOperation
+    except (InvalidOperation, ValueError):
+        await message.answer(
+            "Enter a valid non-negative INR amount with up to two decimal places."
+        )
+        return
+
+    await state.update_data(price_paise=price_paise)
+    await state.set_state(CourseDraft.description)
+    await message.answer("Enter the course description (maximum 2000 characters).")
+
+
+@dp.message(CourseDraft.description)
+async def draft_description(message: Message, state: FSMContext) -> None:
+    description = (message.text or "").strip()
+
+    if len(description) > MAX_DESCRIPTION_LENGTH:
+        await message.answer("Description is too long. Maximum 2000 characters.")
+        return
+
+    await state.update_data(description=description)
+    await state.set_state(CourseDraft.impact)
+    await message.answer("What will students learn? (maximum 1000 characters)")
+
+
+@dp.message(CourseDraft.impact)
+async def draft_impact(message: Message, state: FSMContext) -> None:
+    impact = (message.text or "").strip()
+
+    if len(impact) > MAX_EXTRA_LENGTH:
+        await message.answer("Please shorten this to 1000 characters or fewer.")
+        return
+
+    await state.update_data(impact=impact)
+    await state.set_state(CourseDraft.prerequisites)
+    await message.answer("Enter prerequisites, or type `None`.")
+
+
+@dp.message(CourseDraft.prerequisites)
+async def draft_prerequisites(message: Message, state: FSMContext) -> None:
+    prerequisites = (message.text or "").strip()
+
+    if len(prerequisites) > MAX_EXTRA_LENGTH:
+        await message.answer("Please shorten this to 1000 characters or fewer.")
+        return
+
+    if prerequisites.lower() == "none":
+        prerequisites = ""
+
+    await state.update_data(prerequisites=prerequisites)
+    await state.set_state(CourseDraft.zip_file)
+    await message.answer(
+        "Now upload the course ZIP as a document.\n"
+        "It must have a .zip filename and be no larger than 19 MiB.\n"
+        "The bot will save it as a draft; it will not publish automatically."
     )
 
-    def operation() -> None:
-        connection = database._connect()
-        try:
-            connection.execute(
-                """
-                INSERT INTO audit_logs (
-                    actor_telegram_id, action, target_type,
-                    target_id, details
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    actor_id,
-                    action,
-                    target_type,
-                    str(target_id) if target_id is not None else None,
-                    serialized_details,
+
+@dp.message(CourseDraft.zip_file, F.document)
+async def draft_zip(message: Message, state: FSMContext) -> None:
+    if not message.from_user or not is_owner(message.from_user.id):
+        await state.clear()
+        await message.answer("⛔ This command is owner-only.")
+        return
+
+    document = message.document
+    if not document:
+        await message.answer("Please upload the ZIP as a document.")
+        return
+
+    filename = document.file_name or ""
+
+    if not filename.lower().endswith(".zip"):
+        await message.answer("The filename must end in .zip. Try again.")
+        return
+
+    if document.file_size is None or document.file_size > MAX_ZIP_BYTES:
+        await message.answer("The ZIP must be no larger than 19 MiB. Try again.")
+        return
+
+    data = await state.get_data()
+    connection = get_db()._connect()
+
+    try:
+        cursor = connection.execute(
+            """
+            INSERT INTO courses (
+                title, category, price_paise, description,
+                impact, prerequisites, telegram_file_id,
+                status, created_by
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'draft', ?)
+            """,
+            (
+                data["title"],
+                data["category"],
+                data["price_paise"],
+                data["description"],
+                data["impact"],
+                data["prerequisites"],
+                document.file_id,
+                message.from_user.id,
+            ),
+        )
+        course_id = cursor.lastrowid
+
+        connection.execute(
+            """
+            INSERT INTO audit_logs (
+                actor_telegram_id, action, target_type,
+                target_id, details
+            )
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                message.from_user.id,
+                "course_draft_created",
+                "course",
+                str(course_id),
+                '{"source":"telegram_upload"}',
+            ),
+        )
+        connection.commit()
+
+    except Exception:
+        connection.rollback()
+        logger.exception("Failed to save course draft")
+        await message.answer(
+            "Could not save the draft. Check the server logs and try again."
+        )
+        return
+    finally:
+        connection.close()
+
+    await state.clear()
+
+    await message.answer(
+        f"✅ Draft created successfully!\n"
+        f"Course ID: <code>{course_id}</code>\n"
+        f"Title: <b>{escape(data['title'])}</b>\n\n"
+        f"Use /drafts to review drafts, then /publish {course_id} "
+        f"to request publication confirmation."
+    )
+
+
+@dp.message(CourseDraft.zip_file)
+async def draft_zip_wrong_type(message: Message) -> None:
+    await message.answer("Please upload the course ZIP as a document.")
+
+
+@dp.message(Command("drafts"))
+async def drafts_command(message: Message) -> None:
+    if not message.from_user or not is_owner(message.from_user.id):
+        await message.answer("⛔ This command is owner-only.")
+        return
+
+    drafts = await database.list_course_drafts(get_db())
+
+    if not drafts:
+        await message.answer("There are no course drafts.")
+        return
+
+    for course in drafts[:50]:
+        await message.answer(
+            f"<b>Draft #{course['id']}</b>\n"
+            f"Title: {escape(course['title'])}\n"
+            f"Category: {escape(course['category'])}\n"
+            f"Price: {money(course['price_paise'])}\n"
+            f"Publish with /publish {course['id']}"
+        )
+
+
+@dp.message(Command("publish"))
+async def publish_command(message: Message) -> None:
+    if not message.from_user or not is_owner(message.from_user.id):
+        await message.answer("⛔ This command is owner-only.")
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /publish COURSE_ID")
+        return
+
+    course_id = int(parts[1])
+    connection = get_db()._connect()
+
+    try:
+        course = connection.execute(
+            "SELECT id, title FROM courses WHERE id = ? AND status = 'draft'",
+            (course_id,),
+        ).fetchone()
+    finally:
+        connection.close()
+
+    if not course:
+        await message.answer("Draft not found.")
+        return
+
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="✅ Confirm publish",
+                    callback_data=f"publish_confirm:{course_id}",
                 ),
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
-    await database.run(operation)
-
-
-async def publish_course(
-    database: SQLiteDatabase,
-    course_id: int,
-    owner_id: int,
-) -> bool:
-    """Publish a draft and record the action in one transaction."""
-
-    def operation() -> bool:
-        connection = database._connect()
-        try:
-            connection.execute("BEGIN IMMEDIATE")
-            course = connection.execute(
-                "SELECT title FROM courses WHERE id = ? AND status = 'draft'",
-                (course_id,),
-            ).fetchone()
-
-            if not course:
-                connection.rollback()
-                return False
-
-            connection.execute(
-                """
-                UPDATE courses
-                SET status = 'published', updated_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status = 'draft'
-                """,
-                (course_id,),
-            )
-            connection.execute(
-                """
-                INSERT INTO audit_logs (
-                    actor_telegram_id, action, target_type,
-                    target_id, details
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (
-                    owner_id,
-                    "course_published",
-                    "course",
-                    str(course_id),
-                    json.dumps({"title": course["title"]}),
+                InlineKeyboardButton(
+                    text="❌ Cancel",
+                    callback_data="publish_cancel",
                 ),
+            ]
+        ]
+    )
+
+    await message.answer(
+        f"Publish this course?\n\n"
+        f"<b>{escape(course['title'])}</b>\n"
+        f"ID: <code>{course_id}</code>",
+        reply_markup=keyboard,
+    )
+
+
+@dp.callback_query(F.data.startswith("publish_confirm:"))
+async def publish_confirm_callback(callback: CallbackQuery) -> None:
+    if not is_owner(callback.from_user.id):
+        await callback.answer("Owner-only action.", show_alert=True)
+        return
+
+    if not callback.data:
+        await callback.answer("Invalid request.", show_alert=True)
+        return
+
+    try:
+        course_id = int(callback.data.split(":", 1)[1])
+    except ValueError:
+        await callback.answer("Invalid course ID.", show_alert=True)
+        return
+
+    published = await database.publish_course(
+        get_db(),
+        course_id,
+        callback.from_user.id,
+    )
+
+    if published:
+        await callback.answer("Course published!")
+        if callback.message:
+            await callback.message.answer(
+                f"✅ Course #{course_id} is now published."
             )
-            connection.commit()
-            return True
-        except Exception:
-            connection.rollback()
-            raise
-        finally:
-            connection.close()
-
-    return await database.run(operation)
+    else:
+        await callback.answer(
+            "Draft not found or already published.",
+            show_alert=True,
+        )
 
 
-async def close_pool(database: SQLiteDatabase | None) -> None:
-    """Compatibility wrapper for the previous PostgreSQL interface."""
-    if database is not None:
-        await database.close()
+@dp.callback_query(F.data == "publish_cancel")
+async def publish_cancel_callback(callback: CallbackQuery) -> None:
+    await callback.answer("Publication cancelled.")
+
+
+# --------------------------------------------------
+# Fallback
+# --------------------------------------------------
+
+@dp.message()
+async def fallback(message: Message) -> None:
+    await message.answer(
+        "I'm not sure what you mean. Use /help to see the available commands.",
+        reply_markup=main_menu(),
+    )
+
+
+# --------------------------------------------------
+# Startup and shutdown
+# --------------------------------------------------
+
+async def main() -> None:
+    global db
+
+    db = await database.create_pool()
+    logger.info("SQLite database initialized.")
+
+    try:
+        me = await bot.get_me()
+        logger.info("Starting CourseVault as @%s", me.username)
+        await dp.start_polling(bot)
+    finally:
+        await database.close_pool(db)
+        await bot.session.close()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        pass
