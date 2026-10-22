@@ -1,12 +1,9 @@
 
-"""CourseVault Telegram bot entry point.
+"""CourseVault Telegram bot.
 
-Python 3.13 compatible.
-Requires aiogram 3.x, asyncpg, and pydantic-settings.
-
-Payments remain disabled until the FamGateway integration is implemented
-and verified. Uploaded ZIPs remain unpublished until the inspection workflow
-marks them as validated.
+Course ZIPs are prepared by the owner and stored as Telegram file IDs.
+Payment checkout and AI features remain disabled until their integrations
+are implemented and tested.
 """
 
 from __future__ import annotations
@@ -40,7 +37,6 @@ class Settings(BaseSettings):
     bot_token: str = Field(min_length=20)
     owner_telegram_id: int = Field(gt=0)
     database_url: str = Field(min_length=1)
-    app_env: str = "production"
     log_level: str = "INFO"
 
     model_config = SettingsConfigDict(
@@ -61,9 +57,9 @@ logger = logging.getLogger("coursevault")
 dp = Dispatcher()
 pool: asyncpg.Pool | None = None
 
-# Conservative provisional upload limit. Confirm Telegram and host limits
-# before production; ZIP content inspection is a separate required control.
-MAX_ZIP_BYTES = 45 * 1024 * 1024
+# Conservative upload cap. Confirm Telegram's current limits for your
+# deployment before increasing this value.
+MAX_ZIP_BYTES = 19 * 1024 * 1024
 MAX_TITLE_LENGTH = 160
 MAX_CATEGORY_LENGTH = 80
 MAX_DESCRIPTION_LENGTH = 3500
@@ -224,8 +220,7 @@ async def start(message: Message) -> None:
 
     await message.answer(
         "🎓 <b>Welcome to CourseVault!</b>\n\n"
-        "Discover courses, explore categories, and save your favourites.\n\n"
-        "Choose an option below to get started.",
+        "Discover courses, explore categories, and save your favourites.",
         reply_markup=main_menu(),
     )
 
@@ -235,13 +230,13 @@ async def help_command(message: Message) -> None:
     await message.answer(
         "<b>CourseVault Help</b>\n\n"
         "/start — Main menu\n"
-        "/courses — Browse courses\n"
+        "/courses — Browse published courses\n"
         "/categories — Browse categories\n"
-        "/wishlist — Saved courses\n\n"
+        "/wishlist — View saved courses\n\n"
         "<b>Owner commands</b>\n"
         "/addcourse — Create a course draft\n"
         "/drafts — List drafts\n"
-        "/publish ID — Request publication review"
+        "/publish ID — Request publication"
     )
 
 
@@ -262,6 +257,7 @@ async def wishlist_command(message: Message) -> None:
         return
 
     rows = await database.list_wishlist(db(), user.id)
+
     if not rows:
         await message.answer("Your wishlist is empty.")
         return
@@ -309,46 +305,44 @@ async def categories_callback(callback: CallbackQuery) -> None:
 
 @dp.callback_query(F.data.startswith("category:"))
 async def category_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-
     if not callback.data or not callback.message:
+        await callback.answer()
         return
 
     try:
         index = int(callback.data.split(":", 1)[1])
     except ValueError:
-        await callback.message.answer("Invalid category selection.")
+        await callback.answer("Invalid category.", show_alert=True)
         return
 
     categories = await database.list_categories(db())
     if index < 0 or index >= len(categories):
-        await callback.message.answer(
-            "Categories changed. Please open Categories again."
-        )
+        await callback.answer("Categories changed. Try again.", show_alert=True)
         return
 
+    await callback.answer()
     await show_courses(callback.message, categories[index])
 
 
 @dp.callback_query(F.data.startswith("course:"))
 async def course_callback(callback: CallbackQuery) -> None:
-    await callback.answer()
-
     if not callback.data or not callback.message:
+        await callback.answer()
         return
 
     try:
         course_id = int(callback.data.split(":", 1)[1])
     except ValueError:
-        await callback.message.answer("Invalid course selection.")
+        await callback.answer("Invalid course.", show_alert=True)
         return
 
     course = await database.get_course(db(), course_id)
     if course is None:
-        await callback.message.answer("This course is unavailable.")
+        await callback.answer("Course unavailable.", show_alert=True)
         return
 
-    text = (
+    await callback.answer()
+    await callback.message.answer(
         f"📘 <b>{escape(course['title'])}</b>\n\n"
         f"<b>Category:</b> {escape(course['category'])}\n"
         f"<b>Price:</b> {money(course['price_paise'])}\n\n"
@@ -357,10 +351,7 @@ async def course_callback(callback: CallbackQuery) -> None:
         f"<b>Impact on You</b>\n"
         f"{escape(course['impact'] or 'Not specified yet.')}\n\n"
         f"<b>Prerequisites</b>\n"
-        f"{escape(course['prerequisites'] or 'Not specified.')}"
-    )
-    await callback.message.answer(
-        text,
+        f"{escape(course['prerequisites'] or 'Not specified.')}",
         reply_markup=course_keyboard(course_id),
     )
 
@@ -368,7 +359,6 @@ async def course_callback(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "wishlist")
 async def wishlist_callback(callback: CallbackQuery) -> None:
     await callback.answer()
-
     if not callback.message:
         return
 
@@ -416,10 +406,8 @@ async def save_callback(callback: CallbackQuery) -> None:
         callback.from_user.id,
         course_id,
     )
-
     await callback.answer(
         "Added to wishlist." if saved else "Already saved.",
-        show_alert=False,
     )
 
 
@@ -445,8 +433,8 @@ async def share_callback(callback: CallbackQuery) -> None:
         await callback.answer("Bot username unavailable.", show_alert=True)
         return
 
-    link = f"https://t.me/{bot_info.username}?start=course_{course_id}"
     await callback.answer()
+    link = f"https://t.me/{bot_info.username}?start=course_{course_id}"
     await callback.message.answer(
         f"Share <b>{escape(course['title'])}</b> with a friend:\n{link}"
     )
@@ -455,10 +443,9 @@ async def share_callback(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("buy:"))
 async def buy_callback(callback: CallbackQuery) -> None:
     await callback.answer()
-
     if callback.message:
         await callback.message.answer(
-            "🛒 Checkout is not enabled yet. No payment has been taken "
+            "🛒 Checkout is not enabled yet. No payment has been taken, "
             "and no course access has been granted."
         )
 
@@ -468,8 +455,8 @@ async def ai_info_callback(callback: CallbackQuery) -> None:
     await callback.answer()
     if callback.message:
         await callback.message.answer(
-            "🤖 The AI Tutor will be enabled after provider integration, "
-            "content indexing, and usage limits are configured."
+            "🤖 The AI Tutor will be available after AI integration "
+            "and usage controls are configured."
         )
 
 
@@ -528,13 +515,13 @@ async def draft_price(message: Message, state: FSMContext) -> None:
         if not price.is_finite() or price < 0 or price > Decimal("1000000"):
             raise InvalidOperation
 
-        paise_decimal = price * 100
-        if paise_decimal != paise_decimal.to_integral_value():
+        paise_value = price * 100
+        if paise_value != paise_value.to_integral_value():
             raise InvalidOperation
 
-        paise = int(paise_decimal)
+        paise = int(paise_value)
     except (InvalidOperation, ValueError):
-        await message.answer("Enter a valid INR amount with up to 2 decimals.")
+        await message.answer("Enter a valid INR price with up to two decimals.")
         return
 
     await state.update_data(price_paise=paise)
@@ -547,8 +534,7 @@ async def draft_description(message: Message, state: FSMContext) -> None:
     value = (message.text or "").strip()
     if not value or len(value) > MAX_DESCRIPTION_LENGTH:
         await message.answer(
-            f"Description must be between 1 and {MAX_DESCRIPTION_LENGTH} "
-            "characters."
+            f"Description must be 1-{MAX_DESCRIPTION_LENGTH} characters."
         )
         return
 
@@ -576,7 +562,7 @@ async def skip_prerequisites(
 ) -> None:
     await state.update_data(prerequisites="")
     await state.set_state(CourseDraft.zip_file)
-    await message.answer("Upload the course ZIP as a document.")
+    await message.answer("Upload your prepared course ZIP as a document.")
 
 
 @dp.message(CourseDraft.prerequisites)
@@ -588,7 +574,7 @@ async def draft_prerequisites(message: Message, state: FSMContext) -> None:
 
     await state.update_data(prerequisites=value)
     await state.set_state(CourseDraft.zip_file)
-    await message.answer("Upload the course ZIP as a document.")
+    await message.answer("Upload your prepared course ZIP as a document.")
 
 
 @dp.message(CourseDraft.zip_file, F.document)
@@ -607,38 +593,29 @@ async def draft_zip(message: Message, state: FSMContext) -> None:
 
     filename = (document.file_name or "").strip()
     if not filename.lower().endswith(".zip"):
-        await message.answer("The uploaded filename must end in .zip.")
+        await message.answer("The filename must end in .zip.")
         return
 
     if document.file_size is None or document.file_size <= 0:
-        await message.answer("Unable to verify the file size. Try again.")
+        await message.answer("Unable to verify the file size.")
         return
 
     if document.file_size > MAX_ZIP_BYTES:
         await message.answer(
-            "The ZIP exceeds the current provisional upload limit."
+            f"The ZIP exceeds the current {MAX_ZIP_BYTES // (1024 * 1024)} MB "
+            "upload limit."
         )
         return
 
     data = await state.get_data()
 
-    # A ZIP filename and size do not prove the archive is valid or safe.
-    # Store only as an unpublished, unverified draft.
     course_id = await db().fetchval(
         """
         INSERT INTO courses (
-            title,
-            category,
-            price_paise,
-            description,
-            impact,
-            prerequisites,
-            zip_file_id,
-            zip_size_bytes,
-            zip_validation_status,
-            status
+            title, category, price_paise, description,
+            impact, prerequisites, zip_file_id, status
         )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'unverified', 'draft')
+        VALUES ($1, $2, $3, $4, $5, $6, $7, 'draft')
         RETURNING id
         """,
         data["title"],
@@ -648,7 +625,6 @@ async def draft_zip(message: Message, state: FSMContext) -> None:
         data["impact"],
         data["prerequisites"],
         document.file_id,
-        document.file_size,
     )
 
     await database.write_audit_log(
@@ -657,19 +633,22 @@ async def draft_zip(message: Message, state: FSMContext) -> None:
         "course_draft_created",
         "course",
         str(course_id),
-        {"filename_extension": ".zip", "size_bytes": document.file_size},
+        {
+            "filename_extension": ".zip",
+            "size_bytes": document.file_size,
+        },
     )
 
     await state.clear()
     await message.answer(
-        "✅ <b>Draft created</b>\n\n"
+        "✅ <b>Course draft created</b>\n\n"
         f"ID: <code>{course_id}</code>\n"
         f"Title: <b>{escape(data['title'])}</b>\n"
         f"Price: {money(data['price_paise'])}\n"
-        f"ZIP size: {document.file_size:,} bytes\n\n"
-        "Status: <b>Unverified draft</b>\n"
-        "The ZIP must pass archive inspection before it can be published.\n"
-        f"Review with /drafts. Publication request: /publish {course_id}"
+        f"ZIP size: {document.file_size:,} bytes\n"
+        "Status: <b>Draft</b>\n\n"
+        f"Review it with /drafts, then request publication using "
+        f"/publish {course_id}."
     )
 
 
@@ -685,7 +664,6 @@ async def drafts_command(message: Message) -> None:
         return
 
     rows = await database.list_course_drafts(db())
-
     if not rows:
         await message.answer("There are no course drafts.")
         return
@@ -694,9 +672,7 @@ async def drafts_command(message: Message) -> None:
         await message.answer(
             f"ID: <code>{row['id']}</code>\n"
             f"<b>{escape(row['title'])}</b>\n"
-            f"{escape(row['category'])} · {money(row['price_paise'])}\n"
-            f"ZIP validation: <code>"
-            f"{escape(row['zip_validation_status'])}</code>"
+            f"{escape(row['category'])} · {money(row['price_paise'])}"
         )
 
 
@@ -714,36 +690,21 @@ async def publish_command(message: Message) -> None:
     course_id = int(parts[1])
     course = await db().fetchrow(
         """
-        SELECT id, title, status, zip_validation_status
+        SELECT id, title, status
         FROM courses
-        WHERE id = $1
+        WHERE id = $1 AND status = 'draft'
         """,
         course_id,
     )
 
-    if course is None or course["status"] != "draft":
-        await message.answer("Draft not found.")
-        return
-
-    if course["zip_validation_status"] != "passed":
-        await message.answer(
-            "⛔ Publication blocked: this ZIP has not passed archive "
-            "inspection. The inspection workflow has not been implemented "
-            "yet, so this draft cannot be published."
-        )
-        await database.write_audit_log(
-            db(),
-            message.from_user.id,
-            "course_publish_blocked",
-            "course",
-            str(course_id),
-            {"reason": "zip_not_validated"},
-        )
+    if course is None:
+        await message.answer("Draft not found or no longer available.")
         return
 
     await message.answer(
-        f"Publish <b>{escape(course['title'])}</b>?\n\n"
-        "Confirm only after checking distribution rights and the ZIP review.",
+        f"Publish <b>{escape(course['title'])}</b>?\n"
+        "Confirm only if you have reviewed the package and have the "
+        "rights to distribute it.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -798,11 +759,6 @@ async def confirm_publish(callback: CallbackQuery) -> None:
         await callback.answer("Published.")
         if callback.message:
             await callback.message.answer("✅ Course published successfully.")
-    elif result == "zip_not_validated":
-        await callback.answer(
-            "ZIP validation required.",
-            show_alert=True,
-        )
     else:
         await callback.answer(
             "Draft unavailable or already processed.",
@@ -833,7 +789,7 @@ async def main() -> None:
     except asyncio.CancelledError:
         raise
     except Exception:
-        logger.exception("CourseVault stopped due to an unexpected error")
+        logger.exception("CourseVault stopped unexpectedly")
         raise
     finally:
         await bot.session.close()
